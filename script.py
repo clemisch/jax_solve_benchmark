@@ -1,3 +1,5 @@
+import time
+
 import jax
 import jax.numpy as jnp
 
@@ -20,5 +22,18 @@ grad = jax.jit(
 jax.block_until_ready(solve(A, b))
 jax.block_until_ready(grad(A, b))
 
-%timeit jax.block_until_ready(solve(A, b))
-%timeit jax.block_until_ready(grad(A, b))
+
+def benchmark(label, fn, repeats=10):
+    times = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        jax.block_until_ready(fn())
+        times.append(time.perf_counter() - start)
+
+    mean_ms = sum(times) / len(times) * 1e3
+    best_ms = min(times) * 1e3
+    print(f"{label}: mean={mean_ms:.3f} ms best={best_ms:.3f} ms over {repeats} runs")
+
+
+benchmark("solve", lambda: solve(A, b))
+benchmark("grad", lambda: grad(A, b))
