@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import csv
+import html
 import re
 import subprocess
 import sys
@@ -9,6 +11,10 @@ from pathlib import Path
 
 
 VERSION_RE = re.compile(r"\b\d+\.\d+\.\d+\b")
+BENCHMARK_RE = re.compile(
+    r"^(solve|grad): mean=(\d+\.\d+) ms best=(\d+\.\d+) ms over (\d+) runs$",
+    re.MULTILINE,
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -48,8 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("benchmark_results.txt"),
-        help="output file for benchmark logs (default: benchmark_results.txt)",
+        default=Path("benchmark_results.csv"),
+        help="output file for benchmark rows (default: benchmark_results.csv)",
     )
     return parser.parse_args()
 
@@ -104,18 +110,59 @@ def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def append_section(output_path: Path, lines: list[str]) -> None:
-    with output_path.open("a", encoding="utf-8") as fh:
-        fh.write("\n".join(lines))
-        fh.write("\n\n")
+def write_header(output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=output_columns())
+        writer.writeheader()
 
 
-def format_command_output(label: str, content: str) -> list[str]:
-    if not content.strip():
-        return [f"{label}: <empty>"]
-    lines = [f"{label}:"]
-    lines.extend(content.rstrip().splitlines())
-    return lines
+def append_row(output_path: Path, row: dict[str, str]) -> None:
+    with output_path.open("a", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=output_columns())
+        writer.writerow(row)
+
+
+def output_columns() -> list[str]:
+    return [
+        "timestamp",
+        "version",
+        "status",
+        "solve_mean_ms",
+        "solve_best_ms",
+        "solve_runs",
+        "grad_mean_ms",
+        "grad_best_ms",
+        "grad_runs",
+        "error_type",
+        "error_detail",
+        "stdout",
+        "stderr",
+    ]
+
+
+def compact_text(content: str) -> str:
+    return " ".join(content.split())
+
+
+def escape_multiline_text(content: str) -> str:
+    return html.escape(content.strip()).replace("\n", "&#10;")
+
+
+def parse_benchmark_output(stdout: str) -> dict[str, str]:
+    metrics = {
+        "solve_mean_ms": "",
+        "solve_best_ms": "",
+        "solve_runs": "",
+        "grad_mean_ms": "",
+        "grad_best_ms": "",
+        "grad_runs": "",
+    }
+
+    for label, mean_ms, best_ms, runs in BENCHMARK_RE.findall(stdout):
+        metrics[f"{label}_mean_ms"] = mean_ms
+        metrics[f"{label}_best_ms"] = best_ms
+        metrics[f"{label}_runs"] = runs
+    return metrics
 
 
 def install_version(version: Version) -> subprocess.CompletedProcess[str]:
@@ -137,37 +184,56 @@ def benchmark_script() -> subprocess.CompletedProcess[str]:
 
 
 def benchmark_version(version: Version, output_path: Path) -> None:
-    header = [
-        f"version: {version}",
-        f"timestamp: {timestamp()}",
-    ]
+    row = {
+        "timestamp": timestamp(),
+        "version": str(version),
+        "status": "",
+        "solve_mean_ms": "",
+        "solve_best_ms": "",
+        "solve_runs": "",
+        "grad_mean_ms": "",
+        "grad_best_ms": "",
+        "grad_runs": "",
+        "error_type": "",
+        "error_detail": "",
+        "stdout": "",
+        "stderr": "",
+    }
 
     install_result = install_version(version)
     if install_result.returncode != 0:
-        lines = header + [
-            "status: install_failed",
-            *format_command_output("stdout", install_result.stdout),
-            *format_command_output("stderr", install_result.stderr),
-        ]
-        append_section(output_path, lines)
+        row["status"] = "install_failed"
+        row["error_type"] = "pip_install_failed"
+        row["error_detail"] = compact_text(
+            install_result.stderr or install_result.stdout or "pip install failed"
+        )
+        row["stdout"] = escape_multiline_text(install_result.stdout)
+        row["stderr"] = escape_multiline_text(install_result.stderr)
+        append_row(output_path, row)
         return
 
     benchmark_result = benchmark_script()
     if benchmark_result.returncode != 0:
-        lines = header + [
-            "status: benchmark_failed",
-            *format_command_output("stdout", benchmark_result.stdout),
-            *format_command_output("stderr", benchmark_result.stderr),
-        ]
-        append_section(output_path, lines)
+        row["status"] = "benchmark_failed"
+        row["error_type"] = "script_failed"
+        row["error_detail"] = compact_text(
+            benchmark_result.stderr or benchmark_result.stdout or "script.py failed"
+        )
+        row["stdout"] = escape_multiline_text(benchmark_result.stdout)
+        row["stderr"] = escape_multiline_text(benchmark_result.stderr)
+        row.update(parse_benchmark_output(benchmark_result.stdout))
+        append_row(output_path, row)
         return
 
-    lines = header + [
-        "status: ok",
-        *format_command_output("stdout", benchmark_result.stdout),
-        *format_command_output("stderr", benchmark_result.stderr),
-    ]
-    append_section(output_path, lines)
+    row["status"] = "ok"
+    row["stdout"] = escape_multiline_text(benchmark_result.stdout)
+    row["stderr"] = escape_multiline_text(benchmark_result.stderr)
+    row.update(parse_benchmark_output(benchmark_result.stdout))
+    if not row["solve_mean_ms"] or not row["grad_mean_ms"]:
+        row["status"] = "parse_failed"
+        row["error_type"] = "benchmark_output_unrecognized"
+        row["error_detail"] = "script.py output did not match expected benchmark format"
+    append_row(output_path, row)
 
 
 def main() -> int:
@@ -191,7 +257,7 @@ def main() -> int:
             print(version)
         return 0
 
-    args.output.write_text("", encoding="utf-8")
+    write_header(args.output)
     for version in versions:
         print(f"Benchmarking jax=={version} jaxlib=={version}...")
         benchmark_version(version, args.output)
